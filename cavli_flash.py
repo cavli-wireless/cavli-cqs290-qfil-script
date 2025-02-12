@@ -406,6 +406,42 @@ def process_xml(input_file, output_file, skip_nonhlos):
     else:
         logger.info("No changes detected, output file not overwritten.!!!")    
 
+def safe_int(s, n):
+    try:
+        return int(s,n)
+    except:
+        return -1
+
+def check_is_belong_critical(start, stop):
+    critical_list = [
+        (10504448 ,11241728),
+        (12845056 ,12853248),
+        (12976128 ,12980224),
+    ]
+    for begin,end in critical_list:
+        if (start>=begin and start<end) or (stop>begin and stop<=end):
+            return True
+    return False
+
+def check_safe_xml(input_file):
+    # Read the XML content from the input file
+    i=0
+    with open(input_file, 'r') as file:
+        xml_content = file.read()
+
+    # Parse the XML content
+    root = ET.fromstring(xml_content)
+
+    # Iterate over the program elements
+    for program in root.findall('program'):
+        start_sector = safe_int(program.get('start_sector'), 10)
+        num_partition_sectors = safe_int(program.get('num_partition_sectors'), 10)
+        end_sector = start_sector + num_partition_sectors
+        if check_is_belong_critical(start_sector, end_sector):
+            logger.error("ERROR partition %s is un-safe" % program.get('label'))
+            i=i+1
+    return i
+
 def str_to_bool(value):
     if isinstance(value, bool):
         return value
@@ -459,6 +495,16 @@ def zip_logs(log_dir):
 def clean_resource():
     move_port_trace(log_dir)
     zip_logs(log_dir)
+
+def confirm_before_continue():
+    while True:
+        user_input = input("Do you want to continue? (y/n): ").strip().lower()
+        if user_input in ('y', 'yes'):
+            return True
+        elif user_input in ('n', 'no'):
+            return False
+        else:
+            print("Invalid input. Please enter n or y")
             
 def main():
     setup_logger()
@@ -500,6 +546,12 @@ def main():
     logger.info(f"Skip NON-HLOS: {args.skip_nhlos}")    
     
     fw_path = os.path.abspath(args.fw_path)  # Get absolute path    
+    unsafe_partitiion = check_safe_xml(fw_path + "\\" +args.raw_xml)
+    unsafe_partitiion += check_safe_xml(fw_path + "\\" +args.patch_xml)
+    if unsafe_partitiion > 0:
+        logger.error("Found %i partitions are unsafe. DO YOU WANT TO FLASH ?" % unsafe_partitiion) 
+        if not confirm_before_continue():
+            exit(1)
         # Process the raw XML file
     processed_raw_xml_file = "processed_" + args.raw_xml    
     process_xml(fw_path + "\\" +args.raw_xml, fw_path + "\\" +processed_raw_xml_file , args.skip_nhlos)            
