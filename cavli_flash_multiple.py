@@ -1,19 +1,24 @@
 import os
+import re
+import sys
+import time
+import shutil
+import logging
+import hashlib
+import zipfile
 import argparse
+import threading
 import subprocess
 import serial.tools.list_ports
-import time
-import re
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-import sys
-import hashlib
-import logging
-import shutil  # For moving files
-import zipfile  # For zipping files
 from datetime import datetime
 
-# Global logger instance
+active_ports = set()
+flash_threads = []
+print_lock = threading.Lock()
+
 logger = None
 log_dir = None
 
@@ -46,11 +51,11 @@ def setup_logger():
     file_handler.setFormatter(formatter)
 
     # Add handlers to the logger
-    logger.addHandler(console_handler)
+    # logger.addHandler(console_handler)
     logger.addHandler(file_handler)
 
     logger.info(f"Logging initialized. Log file: {log_file}")
-    
+
 def close_logger():
     """Closes all handlers of the logger."""
     global logger
@@ -58,7 +63,7 @@ def close_logger():
     for handler in handlers:
         handler.close()
         logger.removeHandler(handler)
-        
+
 def read_short_content(file_path, num_lines=4):
     try:
         with open(file_path, 'r') as file:
@@ -238,7 +243,8 @@ def check_file_path(file_path):
 
 def run_command(command, fail_expect=None , fail_expect2=None , success_expect=None):
     logger.info(f"Executing command: {command}")
-    
+    # time.sleep(1)
+    # return 0
     try:
         sucess_count = 0
         # Run the command with subprocess.PIPE for capturing output
@@ -248,34 +254,32 @@ def run_command(command, fail_expect=None , fail_expect2=None , success_expect=N
         for line in process.stdout:
             sys.stdout.write(line)  # Print each line to the terminal in real-time
             # You can also inspect the line here for specific content
-            if fail_expect is not None and fail_expect in line :            
+            if fail_expect is not None and fail_expect in line :
                 logger.info(f"Found the specific string in the output {fail_expect} --> EXIT !!!")
                 clean_resource()
-                exit(5)
-            if fail_expect is not None and fail_expect2 in line :            
+                return -1
+            if fail_expect is not None and fail_expect2 in line :
                 logger.info(f"Found the specific string in the output {fail_expect2} --> EXIT !!!")
                 clean_resource()
-                exit(6)
+                return -6
             if success_expect  is not None and success_expect in line: 
                 logger.info(f"Found the specific string in the output {success_expect} --> MATCH !!!")
                 sucess_count = 1 
         if success_expect is not None and sucess_count == 0 :
             logger.info(f"Can not found string {success_expect} in the output  --> EXIT !!!")
-            clean_resource()
-            exit(13)
+            # clean_resource()
+            return -13
         # Wait for the process to complete and get the final return code
         process.wait()
-        
         if process.returncode != 0:
             # If the process failed, logger.info the error
             sys.stderr.write(process.stderr.read())
             clean_resource()
-            exit(1)  # Exit script if command fails
-            
+            return -1
     except subprocess.CalledProcessError as e:
         logger.info(f"Command failed with error: {e.stderr}")
         clean_resource()
-        exit(1)  # Exit script if command fails
+        return -1
 
 def find_com_ports():
     ports = serial.tools.list_ports.comports()
@@ -433,7 +437,7 @@ def calculate_md5(file_path):
             md5_hash.update(byte_block)
     return md5_hash.hexdigest()
 
-def move_port_trace(log_dir):
+# def move_port_trace(log_dir):
     """Moves the port_trace.txt file to the logs directory and renames it with a timestamp."""
     source_file = "firehose_log.txt"
     if os.path.exists(source_file):
@@ -441,8 +445,8 @@ def move_port_trace(log_dir):
         destination_file = os.path.join(log_dir, f"cavli_flash_firehose_log_{timestamp}.txt")
         shutil.move(source_file, destination_file)
         logger.info(f"Moved {source_file} to {destination_file}")
-    else:
-        logger.warning(f"{source_file} not found. Skipping move operation.")
+    # else:
+    #     logger.warning(f"{source_file} not found. Skipping move operation.")
 
 def zip_logs(log_dir):
     """Zips all files in the logs directory and removes the original files."""
@@ -464,169 +468,362 @@ def zip_logs(log_dir):
                 os.remove(file_path)  # Remove the original file after adding to the zip
 
 def clean_resource():
-    move_port_trace(log_dir)
+    # move_port_trace(log_dir)
     zip_logs(log_dir)
 
 def confirm_before_continue():
-    while True:
-        user_input = input("Do you want to continue? (y/n): ").strip().lower()
-        if user_input in ('y', 'yes'):
-            return True
-        elif user_input in ('n', 'no'):
-            return False
+    try:
+        while True:
+            user_input = input("Do you want to continue? (y/n): ").strip().lower()
+            if user_input in ('y', 'yes'):
+                return True
+            elif user_input in ('n', 'no'):
+                return False
+            else:
+                print("Invalid input. Please enter n or y")
+    except KeyboardInterrupt:
+        print("Exiting...")
+
+
+def get_com_port_description(com_port):
+    com_ports = serial.tools.list_ports.comports()
+    for port, desc, hwid in sorted(com_ports):
+        if port == com_port:
+            return desc
+    return None
+
+def list_com_fastboot_ports(list_ports):
+    ports = serial.tools.list_ports.comports()
+    if ports:
+        for port in ports:
+            desc = get_com_port_description(port.name)
+            if (desc != None and "Qualcomm HS-USB QDLoader 9008" in desc) and not port.name in list_ports and len(list_ports) < 4:
+                return port.name
+    return None
+
+def list_com_ports(list_ports):
+    ports = serial.tools.list_ports.comports()
+    if ports:
+        for port in ports:
+            desc = get_com_port_description(port.name)
+            if (desc != None and "Qualcomm HS-USB QDLoader 9008" in desc) and not port.name in list_ports and len(list_ports) < 4:
+                return port.name
+    return None
+
+def wait_until_its_gone(name):
+    cnt = 20
+    still_wait = True
+    ports = serial.tools.list_ports.comports()
+    while still_wait:
+        found = False
+        if ports:
+            for port in ports:
+                if name == port.name:
+                    found = True
+            if found:
+                time.sleep(0.5)
+                cnt = cnt - 1
+                if cnt == 0:
+                    return False
+                continue
+            else:
+                return True
         else:
-            print("Invalid input. Please enter n or y")
+            return True
 
-def main():
-    setup_logger()
-    start_time = time.time()  # Record the start time
-    # Set up the argument parser with example usage in the description e
-    parser = argparse.ArgumentParser(
-               description=("Cavli Wireless Flashing tool \n\n"
-                     "Example usage:\n"
-                     "    python cavli_flash.py --fw_path=/path/to/firmware --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash\n"
-                     "    python cavli_flash.py --fw_path=/path/to/firmware --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash --skip-nhlos\n"                     
-                     ),
-               formatter_class=argparse.RawTextHelpFormatter
-    )
-    # Optional flags
-    parser.add_argument('--flash', action='store_true', help='Enable flash operation')
-    parser.add_argument('--skip-nhlos', action='store_true', help='Skip flashing NON-HLOS partition (requires --flash)')    
+# ProgressReporter uses a shared rich.progress instance for progress tracking
+class ProgressReporter:
+    def __init__(self, total, desc, progress):
+        self.progress = progress
+        self.task_id = self.progress.add_task(desc, total=total)
+        self.lock = threading.Lock()
 
-    # Keyword-like arguments
-    parser.add_argument('--fw_path', type=str, help='Cavli Firmware Path')
-    parser.add_argument('--patch_xml', type=str, help='Patch XML name (e.g., patch0.xml)')
-    parser.add_argument('--raw_xml', type=str, help='Raw XML name (e.g., rawprogram_unsparse0.xml.xml)')
+    def update(self, n=1):
+        with self.lock:
+            self.progress.update(self.task_id, advance=n)
 
-    args = parser.parse_args()
+    def set(self, n):
+        with self.lock:
+            self.progress.update(self.task_id, completed=n)
 
-    # Check if --flash is provided and enforce required arguments
-    if args.flash:
-        if not all([args.fw_path, args.patch_xml, args.raw_xml]):
-            parser.error("--flash requires --fw_path, --patch_xml, and --raw_xml arguments.")
+    def close(self):
+        with self.lock:
+            # self.progress.update(self.task_id, completed=self.progress.tasks[self.task_id].total)
+            self.progress.remove_task(self.task_id)
 
-    # Check if --skip-nhlos is provided and enforce that --flash is also provided
-    if args.skip_nhlos and not args.flash:
-        parser.error("--skip-nhlos requires the --flash option.")
+# Your actual flashing logic receives a ProgressReporter
+def default_flash_function(port, flash_file, progress):
+    for _ in range(100):
+        time.sleep(0.02)  # Simulate step
+        progress.update(1)
 
-    logger.info(f"Firmware Path: {args.fw_path}")
-    logger.info(f"Patch XML: {args.patch_xml}")
-    logger.info(f"Raw XML: {args.raw_xml}")
-    logger.info(f"Flash Enabled: {args.flash}")
-    logger.info(f"Skip NON-HLOS: {args.skip_nhlos}")
+# Your actual flashing logic receives a ProgressReporter
+def flash_fastboot_function(serial, flash_file, progress):
+    # fastboot flash abl abl_ecc.elf
+    # fastboot flash boot boot.img
+    # fastboot flash dtbo dtbo.img
+    # fastboot flash metadata metadata.img
+    # fastboot flash persist persist.img
+    # fastboot flash recovery recovery.img
+    # fastboot flash super super.img
+    # fastboot flash userdata userdata.img
+    # fastboot flash vbmeta vbmeta.img
+    # fastboot flash vbmeta_system vbmeta_system.img
+    # fastboot reboot
+    partitions = ["abl", "boot", "dtbo", "metadata", "persist", "recovery", "super", "userdata", "vbmeta", "vbmeta_system"]
+    files_path = ["abl_ecc.elf", "boot.img", "dtbo.img", "metadata.img", "persist.img", "recovery.img", "super.img", "userdata.img", "vbmeta.img", "vbmeta_system.img"]
+    step = 99.0 / len(partitions)
+    for partition, file_path in zip(partitions, files_path):
+        cmd = ["fastboot", "-s", serial, "flash", partition, flash_file + "/" + file_path]
+        try:
+            subprocess.run(cmd, check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError as e:
+            # print(f"Error flashing {partition}: {e}")
+            time.sleep(1)
+        progress.update(step)
+    subprocess.run(["fastboot", "-s", serial, "reboot"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True)
+    progress.update(1)
 
-    fw_path = os.path.abspath(args.fw_path)  # Get absolute path
-    unsafe_partitiion = check_safe_xml(fw_path + "\\" +args.raw_xml)
-    unsafe_partitiion += check_safe_xml(fw_path + "\\" +args.patch_xml)
+# Your actual flashing logic receives a ProgressReporter
+def flash_qfil_function(com_port, flash_file, progress):
+    flash = True
+    skip_nhlos = True
+    fw_path = "emmc"
+    patch_xml = "patch0.xml"
+    raw_xml = "rawprogram_unsparse0.xml"
+    start_time = time.time()
+
+    progress.update(5)
+
+    fw_path = os.path.abspath(fw_path)  # Get absolute path
+    unsafe_partitiion = check_safe_xml(fw_path + "\\" +raw_xml)
+    unsafe_partitiion += check_safe_xml(fw_path + "\\" +patch_xml)
     if unsafe_partitiion > 0:
         logger.error("Found %i partitions are unsafe. DO YOU WANT TO FLASH ?" % unsafe_partitiion) 
         if not confirm_before_continue():
             exit(1)
-        # Process the raw XML file
-    processed_raw_xml_file = "processed_" + args.raw_xml    
-    process_xml(fw_path + "\\" +args.raw_xml, fw_path + "\\" +processed_raw_xml_file , args.skip_nhlos)            
-
-    logger.info(f"Checking if device already in EDL mode...") 
-    edl_com_port = list_com_ports()
-    edl_com_port_desc = get_com_port_description(edl_com_port)
-    if edl_com_port_desc is not None:
-        logger.info(f"Device is already in EDL mode... flashing ")   
-        com_port = edl_com_port
-    else:             
-        logger.info(f"Waiting for device connecting !!!")    
-        run_command("adb wait-for-device")
-        adb_devices_output = run_adb_command("adb devices")
-        logger.info(f"ADB device list is {len(adb_devices_output)} !!! ")    
-        if len(adb_devices_output) != 1 :
-            logger.error(f"No device found in ADB yet!!! ")
-            clean_resource()
-            exit(5)
-        # TODO: Verify the EMMC layout safe when overwrite         
-        # logger.info(f"Verify the memory layout and the new layout in {args.fw_path} ...")    
-        # check_the_layout_is_safe(fw_path + "\\" +args.raw_xml)            
-        logger.info(f"Flashing Binary at {args.fw_path}, put device into EDL mode ... ")
-        run_command("adb wait-for-device && adb reboot edl")
-        logger.info(f"Waiting for Windows detect EDL USB ")
-        counter = 10
-        while counter > 0:
-            logger.info(f"Getting COM PORT description")
-            com_port = list_com_ports()
-            com_port_desc = get_com_port_description(com_port)
-
-            if com_port_desc is None:
-                logger.info(f"Cannot find any COM PORT in EDL mode")
-            else:
-                logger.info(f"COM PORT is {com_port}: {com_port_desc} !!!")
-                if "Qualcomm HS-USB QDLoader 9008" in com_port_desc:
-                    logger.info(f"Description of {com_port}: {com_port_desc}")
-                    break
-                else:
-                    logger.info(f"This COM port is not in EDL mode")
-
-            time.sleep(1)
-            counter -= 1  # Decrement the counter after each attempt
-
-        if counter == 0:
-            logger.info("Cannot find any COM PORT in EDL mode")
-            clean_resource()
-            exit(2)
-                    
-        # Sleep 3 second for stable.    
-        logger.info("Wait 3 seconds wait for EDL mode stable")
-        time.sleep(3)
-    
-    patch_xml = args.patch_xml  # Get patch file name
-    raw_xml = processed_raw_xml_file  # Use the processed raw XML file
-    
-    # current_dir = os.getcwd()        
-    
+    processed_raw_xml_file = "processed_" + raw_xml    
+    process_xml(fw_path + "\\" +raw_xml, fw_path + "\\" +processed_raw_xml_file , skip_nhlos)            
+    patch_xml = patch_xml
+    raw_xml = processed_raw_xml_file
     prog_firehose = os.path.join(fw_path, 'prog_firehose_ddr.elf')
     patch_xml_file = os.path.join(fw_path, patch_xml)
     raw_xml_file = os.path.join(fw_path, raw_xml)
-    
     search_path = fw_path
-
     if check_file_path(prog_firehose) and check_file_path(patch_xml_file) and check_file_path(raw_xml_file):
-        qsahara_command = f"QSaharaServer.exe -p \\\\.\\{com_port} -s 13:{prog_firehose} | tee -a firehose_log.txt"
+
+        progress.update(5)
+
+        qsahara_command = f"QSaharaServer.exe -p \\\\.\\{com_port} -s 13:{prog_firehose} > firehose_log.txt"
         fh_loader_getstorageinfo_command = (
             f"fh_loader.exe --port=\\\\.\\{com_port} --getstorageinfo=0 --noprompt "
-            f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc | tee -a firehose_log.txt"
+            f"--showpercentagecomplete --zlpawarehost=1 --memoryname=emmc > firehose_log.txt"
         )
-               
+
         fh_loader_patch_command = (
             f"fh_loader.exe --port=\\\\.\\{com_port} --sendxml={patch_xml_file} "
-            f"--search_path={search_path} --noprompt --showpercentagecomplete --verbose "
-            f"--zlpawarehost=1 --memoryname=emmc | tee -a firehose_log.txt"
+            f"--search_path={search_path} --noprompt --showpercentagecomplete "
+            f"--zlpawarehost=1 --memoryname=emmc > firehose_log.txt"
         )
-        
+
         fh_loader_raw_command = (
             f"fh_loader.exe --port=\\\\.\\{com_port} --sendxml={raw_xml_file} "
-            f"--search_path={search_path} --noprompt --showpercentagecomplete --verbose "
-            f"--zlpawarehost=1 --memoryname=emmc | tee -a firehose_log.txt"
+            f"--search_path={search_path} --noprompt --showpercentagecomplete "
+            f"--zlpawarehost=1 --memoryname=emmc > firehose_log.txt"
         )
-        
+
         fh_loader_setactivepartition_command = (
             f"fh_loader.exe --port=\\\\.\\{com_port} --setactivepartition=0 --noprompt "
-            f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc | tee -a firehose_log.txt"
+            f"--showpercentagecomplete --zlpawarehost=1 --memoryname=emmc > firehose_log.txt"
         )
+
         fh_loader_reset_command = (
             f"fh_loader.exe --port=\\\\.\\{com_port} --reset --noprompt --showpercentagecomplete "
-            f"--verbose --zlpawarehost=1 --memoryname=emmc | tee -a firehose_log.txt"
+            f" --zlpawarehost=1 --memoryname=emmc > firehose_log.txt"
         )
 
+        progress.update(5)
         run_command(qsahara_command ,None, None,"File transferred successfully")
+        progress.update(10)
         run_command(fh_loader_getstorageinfo_command, None, None,"{All Finished Successfully}")
+        progress.update(10)
         run_command(fh_loader_raw_command, None, None,"{All Finished Successfully}")
-        run_command(fh_loader_patch_command ,None, None,"{All Finished Successfully}")   
+        progress.update(35)
+        run_command(fh_loader_patch_command ,None, None,"{All Finished Successfully}")
+        progress.update(10)
         run_command(fh_loader_setactivepartition_command, None, None,"{All Finished Successfully}")
+        progress.update(10)
         run_command(fh_loader_reset_command, None, None,"{All Finished Successfully}")
+        progress.update(9)
 
         end_time = time.time()  # Record the end time
-        elapsed_time = end_time - start_time            
+        elapsed_time = end_time - start_time
         logger.info(f"Script execution time: {elapsed_time:.2f} seconds")
-    print("Flash success!!! ")
-    move_port_trace(log_dir)
-    zip_logs(log_dir)
+    # move_port_trace(log_dir)
+    # zip_logs(log_dir)
+    wait_until_its_gone(com_port)
+    progress.update(1)
+    time.sleep(1)
+
+# Thread target
+cnt = 0
+def flash_device(port, flash_file, position, flash_function, list_port, progress):
+    global cnt
+    progress_reporter = ProgressReporter(total=100, desc=f"Flashing {port} {cnt}", progress=progress)
+    cnt = cnt + 1
+    try:
+        flash_function(port, flash_file, progress_reporter)
+    finally:
+        progress_reporter.close()
+
+    with print_lock:
+        sys.stdout.write("\033[K")
+        # list_port.remove(port)
+        print(f"\n[✓] {port} flashed successfully with {flash_file}")
+
+def on_new_device(port, flash_function, list_port, progress, flash_file="./emmc"):
+    t = threading.Thread(target=flash_device, args=(port, flash_file, len(active_ports) - 1, flash_function, list_port, progress))
+    t.start()
+    flash_threads.append(t)
+
+def usb_detect_simulate(port_list, detected_callback, progress):
+    dummy_ports = ["COM1", "COM2", "COM3", "COM4"]
+    for port in dummy_ports:
+        time.sleep(1)
+        if port not in port_list:
+            port_list.add(port)
+            detected_callback(port, progress)
+
+def usb_detect(port_list, detected_callback, progress):
+    try:
+        while True:
+            edl_com_port = list_com_ports(port_list)
+            if edl_com_port is not None:
+                port_list.add(edl_com_port)
+                detected_callback(edl_com_port, progress)
+                time.sleep(0.5) 
+    except KeyboardInterrupt:
+        print("Exiting...")
+
+def usb_fastboot_detect(port_list, detected_callback, progress):
+    try:
+        while True:
+            com_port = get_connected_fastboot_devices(port_list)
+            if com_port is not None:
+                port_list.add(com_port)
+                detected_callback(com_port, progress)
+                time.sleep(0.5) 
+    except KeyboardInterrupt:
+        print("Exiting...")
+
+def get_connected_devices(list):
+    """Returns a list of connected devices' serial numbers."""
+    result = subprocess.run(["adb", "devices"], stdout=subprocess.PIPE, text=True)
+    lines = result.stdout.strip().splitlines()
+    devices = []
+
+    for line in lines[1:]:  # Skip the first line
+        if line.strip() and "device" in line:
+            serial = line.split()[0]
+            if not serial in list:
+                devices.append(serial)
+    return devices
+
+def get_connected_fastboot_devices(port_list):
+    """Returns a list of connected devices' serial numbers."""
+    result = subprocess.run(["fastboot", "devices"], stdout=subprocess.PIPE, text=True)
+    lines = result.stdout.strip().splitlines()
+    devices = []
+    for line in lines[0:]:  # Skip the first line
+        if line.strip() and "fastboot" in line:
+            serial = line.split()[0]
+            if not serial in port_list:
+                devices.append(serial)
+                return serial
+    return None
+
+def reboot_to_edl(serial):
+    """Reboots a specific device into EDL mode."""
+    subprocess.run(["adb", "-s", serial, "reboot", "edl"])
+
+def reboot_to_bootloader(serial):
+    """Reboots a specific device into bootloader mode."""
+    subprocess.run(["adb", "-s", serial, "reboot", "bootloader"])
+
+def run_fastboot_cmd(serial, partition, file):
+    subprocess.run(["fastboot", "-s", serial, "flash", partition, file],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+
+def force_enter_edl():
+    try:
+        list = []
+        while True:
+            devices = get_connected_devices(list)
+            if not devices:
+                time.sleep(1)
+                continue
+            # for i, serial in enumerate(devices):
+            #     print(f"{i + 1}: {serial}")
+            for serial in devices:
+                reboot_to_edl(serial)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Exiting...")
+
+def force_enter_bootloader():
+    try:
+        list = []
+        while True:
+            devices = get_connected_devices(list)
+            if not devices:
+                time.sleep(1)
+                continue
+            # for i, serial in enumerate(devices):
+            #     print(f"{i + 1}: {serial}")
+            for serial in devices:
+                reboot_to_bootloader(serial)
+                list.append(serial)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Exiting...")
+
+def main(flash_function=flash_fastboot_function):
+    setup_logger()
     
-if __name__ == "__main__":    
+    # Create a single Progress instance for all tasks
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeRemainingColumn(),
+        transient=False  # Keep progress display active until explicitly stopped
+    )
+    progress.start()
+
+    try:
+        force_edl_thread = threading.Thread(target=force_enter_bootloader)
+        detect_thread = threading.Thread(target=usb_fastboot_detect, args=(active_ports, lambda port, prog=progress: on_new_device(port, flash_function, active_ports, prog), progress))
+        detect_thread.start()
+        force_edl_thread.start()
+        detect_thread.join()
+        force_edl_thread.join()
+
+        for t in flash_threads:
+            t.join()
+
+        with print_lock:
+            print("\n🔚 All devices have been flashed.")
+    except KeyboardInterrupt:
+        print("Exiting...")
+    finally:
+        progress.stop()
+        close_logger()
+
+if __name__ == "__main__":
     main()
