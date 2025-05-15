@@ -7,7 +7,9 @@ Note:
 	Must run with git bash ( we need tee )
 
 Example usage: 
-	Without QCN backup/restore
-		python cavli_flash.py D:\tmp\c10qm_v1_bin patch_p2K_b128K.xml rawprogram_nand_p2K_b128K.xml 
-	With QCN backup/restore: 
-		python cavli_flash.py D:\tmp\c10qm_v1_bin patch_p2K_b128K.xml rawprogram_nand_p2K_b128K.xml 1
+	Flash full:
+		python3 .\cavli_flash.py --fw_path=emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash
+	Skip modem:
+		python3 .\cavli_flash.py --fw_path=emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash --skip-nhlos
+	Flash multi device
+		python3 .\cavli_flash_multi_edl.py --fw_path=emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash
