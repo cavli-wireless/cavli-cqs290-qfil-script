@@ -1,7 +1,7 @@
 Dependencies: 
 	Window 10 or 11 
 	python3 
-	pip install pyserial
+	python3 -m pip install pyserial rich
 
 Note:
 	Must run with git bash ( we need tee )
