@@ -367,8 +367,13 @@ def process_xml(input_file, output_file, skip_nonhlos):
     # Iterate over the program elements
     for program in root.findall('program'):
         filename = program.get('filename')
+        label = program.get('label')
         if filename:
             if filename == "NON-HLOS.bin" and skip_nonhlos == True :
+                # Set filename to empty and skip insertion of <erase> tag
+                program.set('filename', '')
+            elif label == "modemst1" or label == "modemst2" \
+                or label == "fsg":
                 # Set filename to empty and skip insertion of <erase> tag
                 program.set('filename', '')
             else:
@@ -506,14 +511,14 @@ def confirm_before_continue():
 def flash_function(args, progress_reporter):
     start_time = time.time()
     fw_path = os.path.abspath(args.fw_path)
-    unsafe_partitiion = check_safe_xml(fw_path + "\\" +args.raw_xml)
-    unsafe_partitiion += check_safe_xml(fw_path + "\\" +args.patch_xml)
-    if unsafe_partitiion > 0:
-        logger.error("Found %i partitions are unsafe. DO YOU WANT TO FLASH ?" % unsafe_partitiion) 
-        if not confirm_before_continue():
-            exit(1)
-    processed_raw_xml_file = "processed_" + args.raw_xml    
-    process_xml(fw_path + "\\" +args.raw_xml, fw_path + "\\" +processed_raw_xml_file , args.skip_nhlos)            
+    # unsafe_partitiion = check_safe_xml(fw_path + "\\" +args.raw_xml)
+    # unsafe_partitiion += check_safe_xml(fw_path + "\\" +args.patch_xml)
+    # if unsafe_partitiion > 0:
+    #     logger.error("Found %i partitions are unsafe. DO YOU WANT TO FLASH ?" % unsafe_partitiion) 
+    #     if not confirm_before_continue():
+    #         exit(1)
+    processed_raw_xml_file = "processed_" + args.raw_xml
+    process_xml(fw_path + "\\" +args.raw_xml, fw_path + "\\" + processed_raw_xml_file , args.skip_nhlos)
     com_port = args.port
     patch_xml = args.patch_xml
     raw_xml = processed_raw_xml_file
