@@ -1,21 +1,16 @@
-import struct
-import uuid
-import json
 import subprocess
 import serial.tools.list_ports
 import json
 import os
 import time
-import os
 import re
-import sys
 import time
 import signal
 import logging
+import zipfile
 import argparse
 import threading
 import subprocess
-import zipfile
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from datetime import datetime
@@ -23,12 +18,17 @@ from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
 from dataclasses import dataclass
 from datetime import datetime
 
-GPT_HEADER_FILE = "fh_gpt_header_0"
-GPT_ENTRIES_FILE = "fh_gpt_entries_0"
-SECTOR_SIZE = 512
-OUTPUT_JSON = "gpt_parsed.json"
+DB_FILE = "serial_com_map.json"
+g_run : bool = True
+logger = None
+log_dir = None
 
-PROJECT_DIR = os.getcwd()
+import serial.tools.list_ports
+
+import time
+import serial.tools.list_ports
+
+cwd = os.getcwd()
 
 class ProgressReporter:
     def __init__(self, total, desc, progress):
@@ -42,8 +42,13 @@ class ProgressReporter:
             self.progress.update(self.task_id, advance=n)
 
     def update_desc(self, sub_desc):
+        self.sub_desc = sub_desc
         with self.lock:
-            self.progress.update(self.task_id, description=f"{self.desc} {sub_desc}")
+            self.progress.update(self.task_id, description=f"{self.desc} {self.sub_desc}")
+
+    def update_sub_desc(self, stt):
+        with self.lock:
+            self.progress.update(self.task_id, description=f"{self.desc} {self.sub_desc} {stt}")
 
     def set(self, n):
         with self.lock:
@@ -53,50 +58,90 @@ class ProgressReporter:
         with self.lock:
             self.progress.remove_task(self.task_id)
 
-def zip_logs(log_dir):
-    """Zips all files in the logs directory and removes the original files."""
-    # Generate a zip file name with a timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    zip_file_path = os.path.join(log_dir, f"logs_{timestamp}.zip")
+def _is_qdloader_port(port_info):
+    """
+    Check if the port looks like a Qualcomm QDLoader port.
+    You can customize this based on VID/PID or description.
+    """
+    desc = port_info.description.lower()
+    return (
+        "qdloader" in desc and
+        "9008" in desc
+    )
+
+def get_qdloader_ports():
+    """
+    Get current list of QDLoader ports.
+    """
+    return [p for p in serial.tools.list_ports.comports() if _is_qdloader_port(p)]
+
+def _is_diag_port(port_info):
+    """
+    Check if the port looks like a Qualcomm DIAG port.
+    """
+    desc = port_info.description.lower()
+    return (
+        "diag" in desc and
+        "901D" in desc
+    )
+
+def get_diag_ports():
+    """
+    Get current list of QDLoader ports.
+    """
+    return [p for p in serial.tools.list_ports.comports() if _is_diag_port(p)]
+
+def get_ports_from_serial(serialno):
+    """
+    Get current list of QDLoader ports.
+    """
+    return [p for p in serial.tools.list_ports.comports() if p.serial_number.lower() == serialno]
+
+def get_new_qdloader_before():
+    """
+    Take a snapshot of current QDLoader ports before switching mode.
+    """
+    return get_qdloader_ports()
+
+def get_new_qdloader_after(before_ports, timeout=30, poll_interval=0.5):
+    """
+    Wait until a new QDLoader port appears (not in before_ports).
     
-    logger.info(f"Zipped all log files to {zip_file_path} and removed the originals.")
-    close_logger()
-    # Create a zip file
-    with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(log_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                # Skip zipping the zip file itself
-                if file.endswith(".zip"):
-                    continue
-                zipf.write(file_path, os.path.relpath(file_path, log_dir))
-                os.remove(file_path)  # Remove the original file after adding to the zip
+    Args:
+        before_ports: List of port objects (from get_new_qdloader_before()).
+        timeout: Timeout in seconds.
+        poll_interval: How often to check (in seconds).
 
-def load_gpt_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    Returns:
+        A list of new COM port names (e.g., ['COM5']), or empty list if timeout.
+    """
+    before_set = set(p.device for p in before_ports)
+    logger.info("Waiting for new QDLoader port (timeout={timeout}s)...")
 
-def print_partition(gpt_data, name=None):
-    for p in gpt_data["partitions"]:
-        if name == None or name == p['name']:
-            first = p["first_lba"]
-            last = p["last_lba"]
-            total = last - first + 1
-            logger.info(f"Partition {p['index']}: {p['name']}")
-            logger.info(f"  First LBA : {first}")
-            logger.info(f"  Last LBA  : {last}")
-            logger.info(f"  Total LBAs: {total}")
+    start_time = time.time()
+    while (time.time() - start_time) < timeout:
+        current_ports = get_qdloader_ports()
+        new_ports = [p.device for p in current_ports if p.device not in before_set]
+        if new_ports:
+            logger.info("Detected new QDLoader port(s): {new_ports}")
+            return new_ports[0]
+        time.sleep(poll_interval)
 
-def find_partition(gpt_data, name):
-    for p in gpt_data["partitions"]:
-        if name == p["name"]:
-            first = p["first_lba"]
-            last = p["last_lba"]
-            p["number_lba"] = last - first + 1
-            return p
-    return None
+    logger.warning("Timeout waiting for QDLoader port.")
+    return []
 
-def setup_logger(console):
+def wait_serialno(serialno, timeout=15, poll_interval=0.5):
+    start_time = time.time()
+    while (time.time() - start_time) < timeout:
+        ports = get_ports_from_serial(serialno)
+        if ports != []:
+            return ports[0]
+        time.sleep(poll_interval)
+
+    logger.warning("[WARN] Timeout waiting for QDLoader port.")
+    return []
+
+def setup_logger(console=False):
     """Sets up the logger to log messages to both the console and a file."""
     global logger
     global log_dir
@@ -140,184 +185,192 @@ def close_logger():
         logger.removeHandler(handler)
  
 def clean_resource():
-    logger.info("clean resource")
     zip_logs(log_dir)
 
+
+def zip_logs(log_dir):
+    """Zips all files in the logs directory and removes the original files."""
+    # Generate a zip file name with a timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    zip_file_path = os.path.join(log_dir, f"logs_{timestamp}.zip")
+    
+    logger.info(f"Zipped all log files to {zip_file_path} and removed the originals.")
+    close_logger()
+    # Create a zip file
+    with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, _, files in os.walk(log_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                # Skip zipping the zip file itself
+                if os.path.exists(file_path):
+                    if file.endswith(".zip"):
+                        continue
+                    zipf.write(file_path, os.path.relpath(file_path, log_dir))
+                    os.remove(file_path)  # Remove the original file after adding to the zip
+
 def run_command(command, fail_expect=None , fail_expect2=None , success_expect=None, savelog=False, 
-                _progress_reporter=None, port="None", parser=None, sub_desc=None):
+                progress_reporter=None, port="None", parser=None, timeout=180):
     logger.info(f"Executing command: {command}")
-    if _progress_reporter is not None and sub_desc is not None:
-        _progress_reporter.update_desc(sub_desc)
+    process = None
+    running = True
+    def kill_process():
+        nonlocal process
+        nonlocal running
+        running = False
+        if progress_reporter is not None:
+            progress_reporter.update_sub_desc("Timeout")
+        process.kill()
+
+    timer = threading.Timer(timeout, kill_process)
+    timer.start()
     try:
         sucess_count = 0
         # Run the command with subprocess.PIPE for capturing output
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+        process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout_lines = []
         for line in process.stdout:
             # Detect progress
-            match = re.search(r'\b(\d+)%', line)
-
+            match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
             if match:
-                percent = match.group(1)
+                percent = float(match.group(1))
                 logger.info(f"Detected percent: {percent}")
-                if _progress_reporter is not None:
-                    _progress_reporter.set(float(percent))
+                if progress_reporter is not None:
+                    progress_reporter.set(float(percent))
             if parser != None:
                 parsed = parser(line)
             if fail_expect is not None and fail_expect in line :
                 logger.info(f"Found the specific string in the output {fail_expect} --> EXIT !!!")
                 clean_resource()
-                exit(5)
+                return 5
             if fail_expect is not None and fail_expect2 in line :
                 logger.info(f"Found the specific string in the output {fail_expect2} --> EXIT !!!")
                 clean_resource()
-                exit(6)
+                return 6
             if success_expect is not None and success_expect in line: 
                 logger.info(f"Found the specific string in the output {success_expect} --> MATCH !!!")
+                progress_reporter.set(100)
                 sucess_count = 1
-            logger.info(line[:len(line)-1])
+            logger.info(line)
             stdout_lines.append(line)
             if savelog:
                 with open(f"firehose_log_{port}.txt", "a") as log_file:
                     log_file.write(line)
+            
+            if not running:
+                break
 
+        timer.cancel()
         process.wait()
 
         if success_expect is not None and sucess_count == 0 :
             logger.info(f"Can not found string {success_expect} in the output  --> EXIT !!!")
             clean_resource()
-            exit(13)
+            return 13
 
         if process.returncode != 0:
-            sys.stderr.write(process.stderr.read())
             clean_resource()
-            exit(1)
-
-        if _progress_reporter is not None:
-            # _progress_reporter.update(100)
-            time.sleep(1)
+            return 1
 
     except subprocess.CalledProcessError as e:
         logger.info(f"Command failed with error: {e.stderr}")
         clean_resource()
-        exit(1)
+        return 1
+    return 0
 
-def parse_gpt_header(data: bytes):
-    if data[0:8] != b"EFI PART":
-        raise ValueError("Invalid GPT header signature")
+def adb_devices():
+    result = subprocess.run(["adb", "devices"], capture_output=True, text=True)
+    lines = result.stdout.strip().splitlines()[1:]
+    return [line.split()[0] for line in lines if "device" in line]
 
-    header = {
-        "revision": struct.unpack("<I", data[8:12])[0],
-        "header_size": struct.unpack("<I", data[12:16])[0],
-        "current_lba": struct.unpack("<Q", data[24:32])[0],
-        "backup_lba": struct.unpack("<Q", data[32:40])[0],
-        "first_usable_lba": struct.unpack("<Q", data[40:48])[0],
-        "last_usable_lba": struct.unpack("<Q", data[48:56])[0],
-        "disk_guid": str(uuid.UUID(bytes_le=data[56:72])),
-        "partition_entries_lba": struct.unpack("<Q", data[72:80])[0],
-        "num_partition_entries": struct.unpack("<I", data[80:84])[0],
-        "size_of_partition_entry": struct.unpack("<I", data[84:88])[0],
-    }
+def adb_set_diag(serial):
+    subprocess.run(["adb", "-s", serial, "root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "-s", serial, "wait-for-device"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "-s", serial, "shell", "setprop sys.usb.config diag,adb"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "-s", serial, "wait-for-device"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    return header
+def get_ports():
+    return list(serial.tools.list_ports.comports())
 
-def parse_gpt_entries(data: bytes, entry_size: int, max_entries: int = 128):
-    entries = []
-    for i in range(max_entries):
-        offset = i * entry_size
-        entry = data[offset:offset + entry_size]
-        if entry[0:16] == b"\x00" * 16:
-            continue  # Unused
+def load_db(force):
+    if not force and os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    return {}
 
-        part = {
-            "index": i,
-            "type_guid": str(uuid.UUID(bytes_le=entry[0:16])),
-            "unique_guid": str(uuid.UUID(bytes_le=entry[16:32])),
-            "first_lba": struct.unpack("<Q", entry[32:40])[0],
-            "last_lba": struct.unpack("<Q", entry[40:48])[0],
-            "attributes": struct.unpack("<Q", entry[48:56])[0],
-            "name": entry[56:128].decode("utf-16le").rstrip("\x00")
-        }
-        entries.append(part)
-    return entries
+def save_db(db):
+    with open(DB_FILE, 'w') as f:
+        json.dump(db, f, indent=4)
 
-def parser_gpt(header, entries, out_json):
-    with open(header, "rb") as f:
-        header_data = f.read(SECTOR_SIZE)
-
-    gpt_header = parse_gpt_header(header_data)
-
-    with open(entries, "rb") as f:
-        entries_data = f.read()
-
-    gpt_entries = parse_gpt_entries(
-        entries_data,
-        gpt_header["size_of_partition_entry"],
-        gpt_header["num_partition_entries"]
-    )
-
-    # Save to JSON
-    output = {
-        "header": gpt_header,
-        "partitions": gpt_entries
-    }
-
-    with open(out_json, "w", encoding="utf-8") as out:
-        json.dump(output, out, indent=4)
-
-    logger.info(f"GPT data saved to: {out_json}")
-
-def get_com_port_description(com_port):
-    com_ports = serial.tools.list_ports.comports()
-    for port, desc, hwid in sorted(com_ports):
-        if port == com_port:
-            return desc
-    return None
-
-def list_com_ports(list_ports=None):
+def find_com(serialid):
     ports = serial.tools.list_ports.comports()
-    if ports:
-        for port in ports:
-            desc = get_com_port_description(port.name)
-            if (list_ports == None) or ((desc != None and "Qualcomm HS-USB QDLoader 9008" in desc) and (not port.name in list_ports) and (len(list_ports) < 4)):
-                return port.name
+    for port in ports:
+        if (serialid == port.serial_number.lower()):
+            logger.info(f"Find {serialid} -> {port.device}")
+            return port.device
     return None
 
-def usb_edl_detect(port_list, detected_callback=None, progress=None):
-    while True:
-        edl_com_port = list_com_ports(port_list)
-        if edl_com_port is not None:
-            logger.info(f"Detected COM port: {edl_com_port}")
-            if not port_list is None:
-                port_list.add(edl_com_port)
-            if detected_callback != None:
-                time.sleep(1)
-                detected_callback(edl_com_port)
-            continue
-        time.sleep(0.5)
-
-def flash_device(args, port, flash_file, position, flash_function, list_port, progress):
-    if progress != None:
-        progress_reporter = ProgressReporter(total=100, desc=f"Flashing {port}", progress=progress)
+def remove_old_file(file_path):
+    """Remove the old file if it exists."""
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        logger.info(f"Removed old file: {file_path}")
     else:
-        progress_reporter = None
-    args.port = port
-    flash_function(args, progress_reporter, list_port)
-    if progress_reporter != None:
-        progress_reporter.close()
-    print(f"[✓] {port} flashed successfully")
+        logger.info(f"No old file to remove: {file_path}")
 
-def on_new_device(args, port, flash_function, active_ports, progress, flash_file="./emmc"):
-    if flash_function != None:
-        t = threading.Thread(target=flash_device, args=(args, port, flash_file, len(active_ports) - 1, flash_function, active_ports, progress))
-        t.start()
+def process_xml(input_file, output_file, skip_nonhlos):
+    # remove_old_file(output_file)
+    if os.path.exists(output_file):
+        with open(output_file, 'r') as file:
+            existing_content = file.read()
+    else:
+        existing_content = None
+    # Read the XML content from the input file
+    with open(input_file, 'r') as file:
+        xml_content = file.read()
 
-def force_exit(sig, frame):
-    global g_run
-    g_run=False
-    zip_logs(log_dir)
-    os._exit(1)
+    # Print the content of the input file
+    logger.debug("Input XML Content:")
+    logger.debug(xml_content)
+    logger.debug("-" * 50)
+
+    # Parse the XML content
+    root = ET.fromstring(xml_content)
+
+    # List to keep track of elements to be inserted
+    elements_to_insert = []
+
+    # Iterate over the program elements
+    for program in root.findall('program'):
+        filename = program.get('filename')
+        label = program.get('label')
+    # Insert the new elements in reverse order to avoid affecting indices
+    for program, erase_element in reversed(elements_to_insert):
+        index = list(root).index(program) + 1
+        root.insert(index, erase_element)
+
+    # Convert the modified XML back to a string
+    rough_string = ET.tostring(root, encoding='unicode', method='xml')
+
+    # Prettify the XML output
+    reparsed = minidom.parseString(rough_string)
+    pretty_xml_content = reparsed.toprettyxml(indent="  ")
+
+    # Remove extra blank lines added by topprettyxml
+    pretty_xml_content = "\n".join([line for line in pretty_xml_content.splitlines() if line.strip()])
+
+    # Print the content of the output XML (before writing it to a file)
+    logger.debug("Output XML Content:")
+    logger.debug(pretty_xml_content)
+    logger.debug("-" * 50)
+
+    # Only write if content differs
+    if pretty_xml_content != existing_content:
+        remove_old_file(output_file)
+        with open(output_file, 'w') as file:
+            file.write(pretty_xml_content)
+        logger.info(f"Modified XML has been written to {output_file}")
+    else:
+        logger.info("No changes detected, output file not overwritten.!!!")
 
 def check_file_path(file_path):
     if os.path.isfile(file_path):
@@ -327,235 +380,190 @@ def check_file_path(file_path):
         logger.info(f"The file at {file_path} does not exist.")
         return False
 
-def dump_partition(serial_device, gpt, com_port, search_path, partition, progress_reporter=None):
-    infor = find_partition(gpt, partition)
-    fh_loader_dump_partition_command = (
-        f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} "
-        f"--search_path={search_path} "
-        f"--convertprogram2read "
-        f"--sendimage=dump_{serial_device}_{partition}.bin "
-        f"--start_sector={infor["first_lba"]} "
-        f"--lun=0 "
-        f"--num_sectors={infor["number_lba"]} "
-        f"--noprompt "
-        f"--showpercentagecomplete "
-        f"--zlpawarehost=1 "
-        f"--memoryname=emmc "
-    )
-    run_command(fh_loader_dump_partition_command, None, None, None, True, None, com_port)
+import threading
 
-def flash_partition(serial_device, gpt, com_port, search_path, partition, progress_reporter=None):
-    infor = find_partition(gpt, partition)
-    fh_loader_flash_partition_command = (
-        f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} "
-        f"--search_path={search_path} "
-        f"--sendimage=dump_{serial_device}_{partition}.bin "
-        f"--start_sector={infor["first_lba"]} "
-        f"--lun=0 "
-        f"--noprompt "
-        f"--showpercentagecomplete "
-        f"--zlpawarehost=1 "
-        f"--memoryname=emmc "
-    )
-    run_command(fh_loader_flash_partition_command, None, None, None, True, None, com_port)
-
-def check_infor_function(args, progress_reporter=None, active_port=None):
-    start_time = time.time()
-    os.chdir(PROJECT_DIR)
+def flash_function(args, progress_reporter=None):
     fw_path = os.path.abspath(args.fw_path)
+    processed_raw_xml_file = "processed_" + args.raw_xml
+    process_xml(fw_path + "\\" +args.raw_xml, fw_path + "\\" + processed_raw_xml_file , args.skip_nhlos)
     com_port = args.port
     patch_xml = args.patch_xml
-    raw_xml = args.raw_xml
+    raw_xml = processed_raw_xml_file
     prog_firehose = os.path.join(fw_path, 'prog_firehose_ddr.elf')
     patch_xml_file = os.path.join(fw_path, patch_xml)
     raw_xml_file = os.path.join(fw_path, raw_xml)
     search_path = fw_path
-    os.chdir(fw_path)
+
     if check_file_path(prog_firehose) and check_file_path(patch_xml_file) and check_file_path(raw_xml_file):
-        result_holder = {"serial": None}
-        qsahara_command = f"{PROJECT_DIR}\\QSaharaServer.exe -p \\\\.\\{com_port} -s 13:{prog_firehose}"
+        old_ports=get_new_qdloader_before()
+        subprocess.run(["adb", "-s", args.serialno, "wait-for-device"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "-s", args.serialno, "root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "-s", args.serialno, "wait-for-device"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "-s", args.serialno, "reboot", "edl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        com_port = get_new_qdloader_after(old_ports)
+        logger.info(f"Found new port {com_port}")
+        qsahara_command = f"{cwd}\\QSaharaServer.exe -p \\\\.\\{com_port} -s 13:{prog_firehose}"
+        logger.info(f"qsahara_command {qsahara_command}")
+        time.sleep(3)
         fh_loader_getstorageinfo_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --getstorageinfo=0 --noprompt "
+            f"{cwd}\\fh_loader.exe --port=\\\\.\\{com_port} --getstorageinfo=0 --noprompt "
             f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc"
         )
-        fh_loader_getstorageinfo_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --search_path={search_path} --getstorageinfo=0 --noprompt "
-            f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc"
-        )
-        fh_loader_resetedl_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --search_path={PROJECT_DIR} --sendxml=ResetToEDL.xml --noprompt "
-            f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc"
-        )
+
         fh_loader_patch_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --sendxml={patch_xml_file} "
+            f"{cwd}\\fh_loader.exe --port=\\\\.\\{com_port} --sendxml={patch_xml_file} "
             f"--search_path={search_path} --noprompt --showpercentagecomplete --verbose "
             f"--zlpawarehost=1 --memoryname=emmc"
         )
         
         fh_loader_raw_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --sendxml={raw_xml_file} "
+            f"{cwd}\\fh_loader.exe --port=\\\\.\\{com_port} --sendxml={raw_xml_file} "
             f"--search_path={search_path} --noprompt --showpercentagecomplete --verbose "
             f"--zlpawarehost=1 --memoryname=emmc"
         )
         
         fh_loader_setactivepartition_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --setactivepartition=0 --noprompt "
+            f"{cwd}\\fh_loader.exe --port=\\\\.\\{com_port} --setactivepartition=0 --noprompt "
             f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc"
         )
         fh_loader_reset_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --reset --noprompt --showpercentagecomplete "
+            f"{cwd}\\fh_loader.exe --port=\\\\.\\{com_port} --reset --noprompt --showpercentagecomplete "
             f"--verbose --zlpawarehost=1 --memoryname=emmc"
         )
-        fh_loader_dump_gpt_header_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} "
-            f"--search_path={search_path} "
-            f"--convertprogram2read "
-            f"--sendimage=fh_gpt_header_0 "
-            f"--start_sector=1 "
-            f"--lun=0 "
-            f"--num_sectors=1 "
-            f"--noprompt "
-            f"--showpercentagecomplete "
-            f"--zlpawarehost=1 "
-            f"--memoryname=emmc"
+
+        run_command(qsahara_command ,None, None,"File transferred successfully", True, progress_reporter, com_port)
+        run_command(fh_loader_getstorageinfo_command, None, None,"{All Finished Successfully}", True, progress_reporter, com_port)
+        run_command(fh_loader_raw_command, None, None,"{All Finished Successfully}", True, progress_reporter, com_port)
+        run_command(fh_loader_patch_command ,None, None,"{All Finished Successfully}", True, progress_reporter, com_port)
+        run_command(fh_loader_setactivepartition_command, None, None,"{All Finished Successfully}", True, progress_reporter, com_port)
+        run_command(fh_loader_reset_command, None, None,"{All Finished Successfully}", True, progress_reporter, com_port)
+
+def process_device(db, serial_id, device_info, args, progress_reporter, db_lock):
+    serialno = device_info["name"]
+    comport = device_info["port"]
+    xqcn_path = f"C:\\Temp\\{serialno}.xqcn"
+    start_time = time.time()
+    retcode=0
+    # 1. Backup QCN
+    if not device_info["QCN_backup"]:
+        logger.debug(f"Backup QCN: serialno={serialno} comport={comport}")
+        qfil_cmd = (
+            f"{cwd}\\QFIL.exe -RESETPARAM -Mode=3 "
+            f"-QCNPATH=\"{xqcn_path}\" "
+            f"-COM={comport} -RESETAFTERDOWNLOAD=false -SPCCODE=\"000000\" -BACKUPQCN"
         )
-        fh_loader_dump_gpt_entries_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} "
-            f"--search_path={search_path} "
-            f"--convertprogram2read "
-            f"--sendimage=fh_gpt_entries_0 "
-            f"--start_sector=2 "
-            f"--lun=0 "
-            f"--num_sectors=32 "
-            f"--noprompt "
-            f"--showpercentagecomplete "
-            f"--zlpawarehost=1 "
-            f"--memoryname=emmc"
+        progress_reporter[serial_id].update_desc("[1/3] Backup XQCN")
+        progress_reporter[serial_id].update(0)
+        if 0 == run_command(qfil_cmd, None, None, "Finish Backup QCN", True, progress_reporter[serial_id], comport, timeout=600):
+            logger.info("Done backup QCN")
+            progress_reporter[serial_id].update(100)
+        else:
+            retcode=-1
+
+        if os.path.exists(xqcn_path):
+            with db_lock:
+                db[serial_id]["QCN_backup"] = True
+                db[serial_id]["xqcn"] = xqcn_path
+                save_db(db)
+
+    # 2. Flash
+    if not device_info["flashed"]:
+        logger.info(f"Start flash: {serialno}")
+        args.serialno = serialno
+        args.port = comport
+        progress_reporter[serial_id].update_desc("[2/3] Flash IMG")
+        progress_reporter[serial_id].update(0)
+        flash_function(args=args, progress_reporter=progress_reporter[serial_id])
+        progress_reporter[serial_id].update(100)
+        with db_lock:
+            db[serial_id]["flashed"] = True
+            save_db(db)
+
+    # 3. Restore QCN
+    if not device_info["QCN_restore"]:
+        logger.debug(f"Restore QCN: serialno={serialno} comport={comport}")
+        qfil_cmd = (
+            f"{cwd}\\QFIL.exe -RESETPARAM -Mode=3 "
+            f"-QCNPATH=\"{xqcn_path}\" "
+            f"-COM={comport} -RESETAFTERDOWNLOAD=false -SPCCODE=\"000000\" -RESTOREQCN"
         )
-        fh_loader_dump_gpt_entries_2_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} "
-            f"--search_path={search_path} "
-            f"--convertprogram2read "
-            f"--sendimage=fh_gpt_entries_0 "
-            f"--start_sector=2 "
-            f"--lun=0 "
-            f"--noprompt "
-            f"--showpercentagecomplete "
-            f"--zlpawarehost=1 "
-            f"--memoryname=emmc"
-        )
-        fh_loader_reset_command = (
-            f"{PROJECT_DIR}\\fh_loader.exe --port=\\\\.\\{com_port} --reset --noprompt "
-            f"--showpercentagecomplete --verbose --zlpawarehost=1 --memoryname=emmc"
-        )
-        find_serial = lambda line: (
-            result_holder.update({"serial": re.search(r"Device Serial Number: (0x[0-9a-fA-F]+)", line).group(1)})
-            if re.search(r"Device Serial Number: (0x[0-9a-fA-F]+)", line)
-            else None
-        )
-        run_command(qsahara_command ,None, None,"File transferred successfully", True, progress_reporter, com_port, None, "[1/11] Qsahara")
-        run_command(fh_loader_getstorageinfo_command, None, None, None, True, progress_reporter, com_port, find_serial, "[2/11] GetSerialno")
-        serial_device = result_holder["serial"]
-        logger.info(f"Founded device {serial_device}")
+        wait_serialno(serialno, 90)
+        time.sleep(3)
+        progress_reporter[serial_id].update_desc("[3/3] Restore XQCN")
+        progress_reporter[serial_id].update(0)
+        run_command(qfil_cmd, None, None, "Finish Restore QCN", True, progress_reporter[serial_id], comport)
+        progress_reporter[serial_id].update(100)
 
-        run_command(fh_loader_dump_gpt_header_command, None, None, None, True, progress_reporter, com_port, None, "[3/11] GetGPTHead")
-        run_command(fh_loader_dump_gpt_entries_command, None, None, None, True, progress_reporter, com_port, None, "[4/11] GetGPTEntries")
-        run_command(fh_loader_dump_gpt_entries_2_command, None, None, None, True, progress_reporter, com_port, None, "[5/11] VerifyGPT")
-        gpt_header = os.path.join(fw_path, GPT_HEADER_FILE)
-        gpt_etries = os.path.join(fw_path, GPT_ENTRIES_FILE)
-        gpt_out = os.path.join(fw_path, OUTPUT_JSON)
-        parser_gpt(gpt_header, gpt_etries, gpt_out)
-        gpt = load_gpt_json(gpt_out)
-        if progress_reporter:
-            progress_reporter.update_desc("[6/11] Backup modem")
-            progress_reporter.update(0)
-        dump_partition(serial_device, gpt, com_port, search_path, "modemst1")
-        if progress_reporter:
-            progress_reporter.update(20)
-        dump_partition(serial_device, gpt, com_port, search_path, "modemst2")
-        if progress_reporter:
-            progress_reporter.update(40)
-        dump_partition(serial_device, gpt, com_port, search_path, "fsg")
-        if progress_reporter:
-            progress_reporter.update(60)
-        dump_partition(serial_device, gpt, com_port, search_path, "modem_a")
-        if progress_reporter:
-            progress_reporter.update(80)
-        dump_partition(serial_device, gpt, com_port, search_path, "modem_b")
-        if progress_reporter:
-            progress_reporter.update(100)
+        if os.path.exists(xqcn_path):
+            with db_lock:
+                db[serial_id]["QCN_restore"] = True
+                save_db(db)
 
-        run_command(fh_loader_raw_command, None, None, None, True, progress_reporter, com_port, None, "[7/11] SendRaw")
-        run_command(fh_loader_patch_command ,None, None, None, True, progress_reporter, com_port, None, "[8/11] SendPatch")
-        run_command(fh_loader_setactivepartition_command, None, None, None, True, progress_reporter, com_port, None, "[9/11] SetActive")
-    
-        if progress_reporter:
-            progress_reporter.update_desc("[10/11] Restore modem")
-            progress_reporter.update(0)
-        flash_partition(serial_device, gpt, com_port, search_path, "modemst1")
-        if progress_reporter:
-            progress_reporter.update(20)
-        flash_partition(serial_device, gpt, com_port, search_path, "modemst2")
-        if progress_reporter:
-            progress_reporter.update(40)
-        flash_partition(serial_device, gpt, com_port, search_path, "fsg")
-        if progress_reporter:
-            progress_reporter.update(60)
-        flash_partition(serial_device, gpt, com_port, search_path, "modem_a")
-        if progress_reporter:
-            progress_reporter.update(80)
-        flash_partition(serial_device, gpt, com_port, search_path, "modem_b")
-        if progress_reporter:
-            progress_reporter.update(100)
-            progress_reporter.update_desc("[11/11] Reset")
-            progress_reporter.update(0)
-        run_command(fh_loader_reset_command, None, None, None, True, progress_reporter, com_port, None, None)
-        if progress_reporter:
-            progress_reporter.update(100)
-        if active_port!=None:
-            active_port.add(serial_device)
+    subprocess.run(["adb", "-s", serialno, "root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "-s", serialno, "wait-for-device"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["adb", "-s", serialno, "reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    progress_reporter.get(serial_id, None) and progress_reporter[serial_id].close()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    if retcode == 0:
+        print(f"[✓] {serialno} flashed successfully. Time={elapsed_time:.3f}")
+    elif retcode == -1:
+        print(f"[X] {serialno} flashed FAILED at backupQCN. Time={elapsed_time:.3f}")
+def map_serial_com(args, progress):
+    db = load_db(args.force)
+    progress_reporter = {}
+    for d in db:
+        _serialno = d
+        progress_reporter[_serialno] = ProgressReporter(total=100, desc=f"{_serialno}", progress=progress)
+    if True:
+        threads = []
+        db_lock = threading.Lock()
 
-def get_connected_devices(list):
-    """Returns a list of connected devices' serial numbers."""
-    result = subprocess.run(["adb", "devices"], stdout=subprocess.PIPE, text=True)
-    lines = result.stdout.strip().splitlines()
-    devices = []
-
-    for line in lines[1:]:  # Skip the first line
-        if line.strip() and "device" in line:
-            serial = line.split()[0]
-            if not serial in list:
-                devices.append(serial)
-    return devices
-
-def reboot_to_edl(serial):
-    """Reboots a specific device into bootloader mode."""
-    subprocess.run(["adb", "-s", serial, "root"], stdout=subprocess.PIPE, text=True)
-    subprocess.run(["adb", "-s", serial, "wait-for-device"], stdout=subprocess.PIPE, text=True)
-    subprocess.run(["adb", "-s", serial, "reboot", "edl"], stdout=subprocess.PIPE, text=True)
-
-def force_enter_edl(ports_list):
-    try:
-        while True:
-            devices = get_connected_devices(ports_list)
-            if not devices:
-                time.sleep(1)
+        serials = adb_devices()
+        for serial_id in serials:
+            if serial_id in db:
                 continue
-            for serial in devices:
-                reboot_to_edl(serial)
-                ports_list.add(serial)
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Exiting...")
+            adb_set_diag(serial_id)
+            new_com = find_com(serial_id)
+            if new_com:
+                db[serial_id] = {
+                    "name": serial_id,
+                    "port": new_com,
+                    "xqcn": None,
+                    "flashed": False,
+                    "QCN_backup": False,
+                    "QCN_restore": False
+                }
+                save_db(db)
+                print(f"Mapped {serial_id} -> {new_com}")
+                progress_reporter[serial_id] = ProgressReporter(total=100, desc=f"{serial_id}", progress=progress)
+            else:
+                logger.error(f"Could not find COM port for {serial_id}")
 
-if __name__ == "__main__":
+        for serial_id in db:
+            t = threading.Thread(
+                target=process_device,
+                args=(db, serial_id, db[serial_id], args, progress_reporter, db_lock)
+            )
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+def force_exit(sig, frame):
+    global g_run
+    g_run=False
+    zip_logs(log_dir)
+    os._exit(1)
+
+def main():
     parser = argparse.ArgumentParser(
-        description=("Cavli Wireless Flashing tool \n\n"
-                "Example usage:\n"
-                "    python <tool> --fw_path=./emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash\n"
-                "    python <tool> --fw_path=./emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash --skip-nhlos\n"
-                ),
-        formatter_class=argparse.RawTextHelpFormatter
+                description=("Cavli Wireless Flashing tool \n\n"
+                     "Example usage:\n"
+                     "    python <tool> --fw_path=emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash\n"
+                     ),
+                formatter_class=argparse.RawTextHelpFormatter
     )
     # Optional flags
     parser.add_argument('--flash', action='store_true', help='Enable flash operation')
@@ -567,8 +575,9 @@ if __name__ == "__main__":
     parser.add_argument('--raw_xml', type=str, help='Raw XML name (e.g., rawprogram_unsparse0.xml.xml)')
     parser.add_argument('--serialno', type=str, help='Serial number')
     parser.add_argument('--verbose', action='store_true', help='Show console log')
+    parser.add_argument('--force', action='store_true', help='Force flash')
+
     args = parser.parse_args()
-    signal.signal(signal.SIGINT, force_exit)
     if args.verbose:
         progress =None
         setup_logger(True)
@@ -576,20 +585,17 @@ if __name__ == "__main__":
         progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
+            "[progress.percentage]{task.percentage:>0.01f}%",
             TimeRemainingColumn(),
-            transient=False  # Keep progress display active until explicitly stopped
+            transient=False
         )
         progress.start()
         setup_logger(False)
-    ports_list = set()
-    force_edl_thread = threading.Thread(target=force_enter_edl, args=(ports_list,))
-    force_edl_thread.start()
-    detect_thread = threading.Thread(target=usb_edl_detect, 
-                args=(ports_list, 
-                        lambda port: on_new_device(args, port, check_infor_function, ports_list, progress)
-                        )
-                    )
-    detect_thread.start()
-    while True:
-        time.sleep(1)
+
+    signal.signal(signal.SIGINT, force_exit)
+    threading.Thread(target=map_serial_com, args=(args,progress)).start()
+    while g_run:
+        time.sleep(3)
+
+if __name__ == "__main__":
+    main()
