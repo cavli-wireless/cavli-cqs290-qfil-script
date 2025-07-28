@@ -1,0 +1,21 @@
+<Storage Name="C:\Users\muham\Downloads\drivetestbase_NVsefs_only (1).xqcn">
+	<Storage Name="00000000">
+	<Storage Name="default">
+	<Storage Name="NV_NUMBERED_ITEMS">
+	<Stream Name="NV_ITEM_ARRAY" Value="" Length="0">
+	</Stream><Stream Name="NV_ITEM_ARRAY_SIM_1" Value="" Length="0">
+	</Stream><Stream Name="NV_ITEM_ARRAY_SIM_2" Value="" Length="0">
+	</Stream></Storage><Storage Name="EFS_Backup">
+	<Storage Name="EFS_Dir">
+	<Stream Name="00000000" Length="64" Value="01 00 01 01 00 00 00 00 2F 6E 76 2F 69 74 65 6D 5F 66 69 6C 65 73 2F 6D 6F 64 65 6D 2F 6C 74 65 2F 72 72 63 2F 63 61 70 2F 64 69 66 66 5F 66 64 64 5F 74 64 64 5F 66 67 69 5F 65 6E 61 62 6C 65 "/>
+	</Storage><Storage Name="EFS_Data">
+	<Stream Name="00000000" Length="1" Value="01 "/>
+	</Storage></Storage><Storage Name="NV_Items">
+	<Storage Name="EFS_Dir">
+	</Storage><Storage Name="EFS_Data">
+	</Storage></Storage><Storage Name="Provisioning_Item_Files">
+	<Storage Name="EFS_Dir">
+	</Storage><Storage Name="EFS_Data">
+	</Storage></Storage><Stream Name="Mobile_Property_Info" Length="24" Value="00 00 00 00 00 00 00 00 00 000C 0051 4D 53 4C 20 34 2E 31 2E 31 37 39 ">
+	</Stream></Storage></Storage><Stream Length="6" Name="File_Version" Value="02 00 00 00 00 00 ">
+	</Stream></Storage>

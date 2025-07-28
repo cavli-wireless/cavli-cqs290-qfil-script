@@ -1,0 +1,1 @@
+python3 .\cavli_flash_edl.py --fw_path=emmc --patch_xml=patch0.xml --raw_xml=rawprogram_unsparse0.xml --flash --skip-nhlos --oneshot

@@ -1,0 +1,5 @@
+emmc
+logs
+*.txt
+serial_com_map.json
+results
