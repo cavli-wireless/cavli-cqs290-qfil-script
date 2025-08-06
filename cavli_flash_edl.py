@@ -283,9 +283,22 @@ def process_xml(input_file, output_file, skip_nonhlos):
     for program in root.findall('program'):
         filename = program.get('filename')
         label = program.get('label')
+        add_erase = False
+        if filename:
+            if filename == "NON-HLOS.bin" and skip_nonhlos == True :
+                program.set('filename', '')
+            else:
+                add_erase = True
+        elif label == "traceability":
+            add_erase = True
+        if add_erase:
+            erase_element = ET.Element('erase', {k: v for k, v in program.attrib.items() if k != 'filename'})
+            # Keep track of the element to insert later
+            elements_to_insert.append((program, erase_element))
+
     # Insert the new elements in reverse order to avoid affecting indices
     for program, erase_element in reversed(elements_to_insert):
-        index = list(root).index(program) + 1
+        index = list(root).index(program)
         root.insert(index, erase_element)
 
     # Convert the modified XML back to a string
